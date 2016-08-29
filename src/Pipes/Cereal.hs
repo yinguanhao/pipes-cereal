@@ -1,16 +1,27 @@
 {-# Language RankNTypes, LambdaCase, DeriveDataTypeable #-}
 {- |
 Decode @pipes@ byte streams with @cereal@ parsers.
+
+In this module, the following type synonym compatible with the @lens@,
+@lens-family@ and @lens-family-core@ libraries is used but not exported:
+
+@
+type Lens' a b = forall f . 'Functor' f => (b -> f b) -> (a -> f a)
+@
 -}
 module Pipes.Cereal (
+  -- * Encoders
+  encode,
+  encodePut,
   -- * Parsers
   decode,
   decodeEx,
   decodeGet,
   decodeGetEx,
-  -- * Producers
+  -- * Lenses
   decoded,
   decodedEx,
+  -- * Decode multiple values
   decodedGet,
   decodedGetEx,
   -- * @DecodingError@
@@ -21,9 +32,9 @@ module Pipes.Cereal (
   {- |
   "Data.ByteString" re-exports 'ByteString'.
 
-  "Data.Serialize" re-exports 'Serialize' and 'Get'.
+  "Data.Serialize" re-exports 'Serialize', 'Get' and 'Put'.
 
-  "Pipes" re-exports 'Producer', 'yield', 'next' and 'lift'.
+  "Pipes" re-exports 'Producer'.
 
   "Pipes.Parse" re-exports 'Parser', 'StateT', 'runStateT', 'evalStateT' and
   'execStateT'.
@@ -42,13 +53,22 @@ import Control.Monad.Catch (MonadThrow)
 import qualified Control.Monad.Catch as C
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
-import Data.Serialize (Serialize, Get)
+import Data.Serialize (Serialize, Get, Put)
 import qualified Data.Serialize as S
 import Data.Typeable (Typeable)
-import Pipes (Producer, yield, next, lift)
+import Pipes (Producer)
 import qualified Pipes as P
 import Pipes.Parse (Parser, StateT, runStateT, evalStateT, execStateT)
 import qualified Pipes.Parse as P
+
+type Lens' a b = forall f . Functor f => (b -> f b) -> (a -> f a)
+
+-- | Encode a value.
+encode :: (Monad m, Serialize a) => a -> Producer ByteString m ()
+encode = P.yield . S.encode
+
+encodePut :: Monad m => Put -> Producer ByteString m ()
+encodePut = P.yield . S.runPut
 
 -- | Like 'decode' but uses an explicit 'Get'.
 decodeGet :: Monad m => Get a -> Parser ByteString m (Either String a)
@@ -90,24 +110,31 @@ unDraw1 x
   | B.null x = return ()
   | otherwise = P.unDraw x
 
--- | Turns a stream of bytes into a stream of decoded values.
-decoded :: (Monad m, Serialize a) => Producer ByteString m r ->
-  Producer a m (Either (String, Producer ByteString m r) r)
-decoded = decodedGet S.get
+-- | Improper lens between stream of bytes and stream of decoded values.
+decoded :: (Monad m, Serialize a) => Lens' (Producer ByteString m r)
+  (Producer a m (Either (String, Producer ByteString m r) r))
+decoded k p = fmap bw (k ((decodedGet S.get) p))
+  where
+    bw p1 = do
+      er <- P.for p1 encode
+      case er of
+        Left (_, p2) -> p2
+        Right r -> return r
 
--- | Like 'decoded', but throws a 'DecodingError' if decoding failed.
-decodedEx :: (MonadThrow m, Serialize a) => Producer ByteString m r ->
-  Producer a m r
-decodedEx = decodedGetEx S.get
+decodedEx :: (MonadThrow m, Serialize a) => Lens' (Producer ByteString m r)
+  (Producer a m r)
+decodedEx k p = fmap bw (k ((decodedGetEx S.get) p))
+  where
+    bw p1 = P.for p1 encode
 
 -- | Turns a stream of bytes into a stream of decoded values, using an
 -- explicit 'Get'.
 decodedGet :: Monad m => Get a -> Producer ByteString m r ->
   Producer a m (Either (String, Producer ByteString m r) r)
 decodedGet g p = do
-  lift (next1 p) >>= \case
+  P.lift (next1 p) >>= \case
     Left r -> return (Right r)
-    Right (b, p') -> lift (runStateT (decodeGet g) (P.yield b >> p')) >>= \case
+    Right (b, p') -> P.lift (runStateT (decodeGet g) (P.yield b >> p')) >>= \case
       (Left err, p'') -> return (Left (err, p''))
       (Right a, p'') -> P.yield a >> decodedGet g p''
 
@@ -125,7 +152,7 @@ decodedGetEx :: MonadThrow m => Get a -> Producer ByteString m r ->
   Producer a m r
 decodedGetEx g p = decodedGet g p >>= \case
   Right r -> return r
-  Left (err, _) -> lift . C.throwM $ DecodingError err
+  Left (err, _) -> P.lift . C.throwM $ DecodingError err
 
 data DecodingError = DecodingError String
   deriving (Typeable)
